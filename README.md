@@ -1,54 +1,102 @@
 # sdm-collector
 
-ẞDM 백엔드의 공고 수집 트리거 워커.
+ẞDM의 정부지원사업 공고 정제 워커.
 
-GitHub Actions cron으로 정기 실행되며, Railway에 배포된 ẞDM 백엔드 API를 호출해 수집을 시작시킵니다.
-실제 수집 로직(API 호출·파싱·DB 저장)은 백엔드(`sdm-backend`)에서 동작합니다.
+`opportunities_raw` 테이블의 raw 데이터를 룰베이스 추론으로 정제하여 
+`opportunities` 테이블에 upsert.
+
+## 역할
+
+```
+sdm-scrap (한국 IP)
+  ↓ 정부 API raw 응답 → opportunities_raw INSERT
+  ↓ 끝나면 repository_dispatch 'scrap-finished' 이벤트
+  
+sdm-collector (이 레포)
+  ↓ pending raw SELECT (1000건씩)
+  ↓ source별 parser로 정제 (Bizinfo·G2B·...)
+  ↓ opportunities upsert (ON CONFLICT)
+  ↓ raw 처리 상태 마킹 (processed/error)
+```
+
+수집과 정제를 분리한 이유:
+- 수집은 **한국 IP 필요** (정부 API 차단 회피) → GitHub Actions runner
+- 정제는 IP 무관 → 별도 워커
+- 한쪽 망가져도 다른 쪽 안 죽음
 
 ## 구조
 
 ```
-.github/workflows/
-└── bizinfo.yml          # 일 2회 (KST 05:00, 15:30)
-scripts/
-└── trigger.sh           # 로컬 수동 호출용
+sdm-collector/
+├── .github/workflows/
+│   └── collect.yml              repository_dispatch + cron 백업
+├── parsers/
+│   ├── __init__.py              PARSER_REGISTRY
+│   ├── _base.py                 BaseParser 추상 클래스
+│   ├── _schema.py               SchemaCache (동적 컬럼 매핑)
+│   ├── _repository.py           Supabase upsert + raw 마킹
+│   ├── opportunity_dto.py       공통 DTO
+│   ├── bizinfo.py               Bizinfo parser (룰베이스 추론)
+│   └── g2b.py                   G2B parser (입찰공고 → RFP)
+├── run.py                       진입점
+├── requirements.txt
+└── README.md
 ```
 
-## 동작 흐름
+## 동작 트리거
+
+| 트리거 | 시점 |
+|--------|------|
+| `repository_dispatch: scrap-finished` | sdm-scrap 수집 완료 직후 |
+| `workflow_dispatch` | 박사님 수동 실행 |
+| `schedule: cron` | KST 05:30, 16:00 (백업 — 이벤트 놓쳤을 때) |
+
+## GitHub Secrets
 
 ```
-GitHub Actions (KST 05:00, 15:30)
-    ↓
-curl POST → Railway API
-    ↓
-ẞDM Backend
-    ├── Bizinfo API 호출 (8개 카테고리 페이지네이션)
-    ├── parse_items() — 룰베이스 추론
-    └── upsert_opportunities() — Supabase ON CONFLICT
+SUPABASE_URL
+SUPABASE_SERVICE_KEY
 ```
 
-## Secrets 설정
+## 동적 컬럼 매핑
 
-GitHub 레포 Settings → Secrets and variables → Actions
+`SchemaCache`가 시작 시 `get_opportunities_columns()` RPC 호출해서 
+`opportunities` 테이블의 현재 컬럼 셋을 메모리에 캐시.
 
-| Name | 값 |
-|------|------|
-| `RAILWAY_API_URL` | Railway 백엔드 URL (예: `https://web-production-c8d70c.up.railway.app`) |
-| `RAILWAY_ADMIN_TOKEN` | 백엔드 `ADMIN_TOKEN` 환경변수와 매칭되는 값 |
+**컬럼 추가/삭제되어도 collector 코드 수정 불필요** — 알 수 없는 키는 자동으로 무시.
 
-## 수동 트리거
+## 새 source 추가 패턴
+
+예: NTIS 추가 시
+
+1. `parsers/ntis.py` 작성 (BaseParser 상속, `parse_one()` 구현)
+2. `parsers/__init__.py`에 등록:
+   ```python
+   from parsers.ntis import NTISParser
+   PARSER_REGISTRY = {
+       "bizinfo": BizinfoParser(),
+       "g2b": G2BParser(),
+       "ntis": NTISParser(),  # 추가
+   }
+   ```
+3. sdm-scrap에 `scrapers/ntis.py` + 워크플로 추가
+
+## 로컬 실행
 
 ```bash
-RAILWAY_API_URL=https://... \
-RAILWAY_ADMIN_TOKEN=... \
-./scripts/trigger.sh bizinfo
+pip install -r requirements.txt
+
+export SUPABASE_URL=https://kxjgzxyoupfqdrnwjnku.supabase.co
+export SUPABASE_SERVICE_KEY=...
+
+python run.py
 ```
 
-## 향후 추가 예정
+## 운영 관계
 
-- `g2b.yml` — 나라장터
-- `ntis.yml` — 국가과학기술정보
-- `kised.yml` — 창업진흥원
-- `kosme.yml` — 중소벤처기업진흥공단
-- `nipa.yml` — 정보통신산업진흥원
-- `seoul_startup.yml` — 서울창업허브
+```
+sdm-scrap (public)        ← 수집만
+sdm-collector (public)    ← 정제만 (이 레포)
+sdm-backend (private)     ← 사용자 API 서빙
+                            opportunities 테이블에서 SELECT
+```
