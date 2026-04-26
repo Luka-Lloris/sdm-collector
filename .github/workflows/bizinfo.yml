@@ -1,0 +1,42 @@
+name: Bizinfo Collector
+
+on:
+  schedule:
+    # 하루 2회 — KST 05:00 / 15:30
+    # GitHub Actions는 UTC 기준 (KST -9)
+    - cron: '0 20 * * *'    # KST 05:00 (전날 UTC 20:00)
+    - cron: '30 6 * * *'    # KST 15:30 (UTC 06:30)
+  workflow_dispatch:  # 수동 실행 허용
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Trigger Bizinfo collector
+        env:
+          RAILWAY_API_URL: ${{ secrets.RAILWAY_API_URL }}
+          RAILWAY_ADMIN_TOKEN: ${{ secrets.RAILWAY_ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          
+          echo "Triggering Bizinfo collector at $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          
+          response=$(curl -s -w "\n%{http_code}" -X POST \
+            "${RAILWAY_API_URL}/api/v1/admin/collectors/bizinfo/run" \
+            -H "Content-Type: application/json" \
+            -H "X-Admin-Token: ${RAILWAY_ADMIN_TOKEN}" \
+            --max-time 1500)
+          
+          http_code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | head -n -1)
+          
+          echo "HTTP Status: $http_code"
+          echo "Response: $body"
+          
+          if [ "$http_code" -ne 200 ]; then
+            echo "::error::Collector failed with HTTP $http_code"
+            exit 1
+          fi
+          
+          echo "::notice::Bizinfo collection completed successfully"
